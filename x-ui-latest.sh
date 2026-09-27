@@ -828,7 +828,11 @@ configure_xui_db() {
            $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
 
     sqlite3 $XUIDB <<EOF
-DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile");
+-- Modern 3x-ui seeds random subPath/subJsonPath rows on first DB init.
+-- Remove those seed rows before inserting installer-managed values, otherwise
+-- duplicate keys make the subscription server register a different route
+-- from the nginx route generated below.
+DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile","subPath","subJsonPath");
 
 INSERT INTO "settings" ("key","value") VALUES ("subPort",             '${sub_port}');
 INSERT INTO "settings" ("key","value") VALUES ("subPath",             '/${sub_path}/');

@@ -127,6 +127,7 @@ mtr_backend_port=$(make_port)
 # ─── Argument parsing ────────────────────────────────────────────────────────
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        -auto_domain)      AUTODOMAIN="$2";       shift 2 ;;
         -install)          INSTALL="$2";           shift 2 ;;
         -subdomain)        domain="$2";            shift 2 ;;
         -reality_domain)   reality_domain="$2";    shift 2 ;;
@@ -181,6 +182,10 @@ get_server_ip() {
 IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
 [[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
 
+if [[ ${AUTODOMAIN} == *"y"* ]]; then
+    domain="${IP4}.cdn-one.org"
+    reality_domain="${IP4//./-}.cdn-one.org"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DOMAIN VALIDATION
@@ -823,7 +828,11 @@ configure_xui_db() {
            $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
 
     sqlite3 $XUIDB <<EOF
-DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile");
+-- Modern 3x-ui seeds random subPath/subJsonPath rows on first DB init.
+-- Remove those seed rows before inserting installer-managed values, otherwise
+-- duplicate keys make the subscription server register a different route
+-- from the nginx route generated below.
+DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile","subPath","subJsonPath");
 
 INSERT INTO "settings" ("key","value") VALUES ("subPort",             '${sub_port}');
 INSERT INTO "settings" ("key","value") VALUES ("subPath",             '/${sub_path}/');
@@ -1022,6 +1031,121 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CREATE DEFAULT CLIENT
+# ─────────────────────────────────────────────────────────────────────────────
+create_default_client() {
+    # Modern 3x-ui stores clients as first-class records. Use its own API
+    # instead of writing clients/client_inbounds/client_traffics by hand so
+    # UUID/password generation and protocol-specific defaults stay compatible
+    # with the installed panel version.
+    local base_url="https://127.0.0.1:${panel_port}/${panel_path}"
+    local cookie_file csrf_json csrf_token login_payload login_response
+    local inbound_ids client_payload client_response
+    cookie_file=$(mktemp)
+    chmod 600 "${cookie_file}"
+
+    # x-ui was just started by configure_xui_db(); wait until the local API is ready.
+    csrf_json=""
+    for _ in {1..30}; do
+        csrf_json=$(curl -ksS -c "${cookie_file}" "${base_url}/csrf-token" 2>/dev/null || true)
+        if [[ $(printf '%s' "${csrf_json}" | jq -r '.success // false' 2>/dev/null) == "true" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
+    csrf_token=$(printf '%s' "${csrf_json}" | jq -r '.obj // empty' 2>/dev/null)
+    if [[ -z "${csrf_token}" ]]; then
+        rm -f "${cookie_file}"
+        msg_err "Could not obtain CSRF token; default client 'first' was not created."
+        return 1
+    fi
+
+    login_payload=$(jq -nc \
+        --arg username "${config_username}" \
+        --arg password "${config_password}" \
+        '{username:$username,password:$password}')
+
+    login_response=$(curl -ksS \
+        -b "${cookie_file}" -c "${cookie_file}" \
+        -H 'Content-Type: application/json' \
+        -H "X-CSRF-Token: ${csrf_token}" \
+        --data "${login_payload}" \
+        "${base_url}/login" 2>/dev/null || true)
+
+    if [[ $(printf '%s' "${login_response}" | jq -r '.success // false' 2>/dev/null) != "true" ]]; then
+        rm -f "${cookie_file}"
+        msg_err "Panel API login failed; default client 'first' was not created."
+        return 1
+    fi
+
+    # Login may rotate the session. Fetch a fresh token for the authenticated session.
+    csrf_json=$(curl -ksS -b "${cookie_file}" -c "${cookie_file}" \
+        "${base_url}/csrf-token" 2>/dev/null || true)
+    csrf_token=$(printf '%s' "${csrf_json}" | jq -r '.obj // empty' 2>/dev/null)
+    if [[ -z "${csrf_token}" ]]; then
+        rm -f "${cookie_file}"
+        msg_err "Could not refresh CSRF token; default client 'first' was not created."
+        return 1
+    fi
+
+    # Attach the same identity to all four installer-managed inbounds.
+    inbound_ids=$(sqlite3 "${XUIDB}" "
+        SELECT '[' || group_concat(id) || ']'
+        FROM (
+            SELECT id
+            FROM inbounds
+            WHERE tag IN (
+                'inbound-8443',
+                'inbound-${ws_port}',
+                'inbound-/dev/shm/uds2023.sock,0666:0|',
+                'inbound-${trojan_port}'
+            )
+            ORDER BY id
+        );
+    ")
+
+    if ! printf '%s' "${inbound_ids}" | jq -e 'type == "array" and length == 4' >/dev/null 2>&1; then
+        rm -f "${cookie_file}"
+        msg_err "Expected four installer inbounds; default client 'first' was not created."
+        return 1
+    fi
+
+    client_payload=$(jq -nc \
+        --argjson inboundIds "${inbound_ids}" \
+        '{
+            client: {
+                email: "first",
+                subId: "first",
+                totalGB: 0,
+                expiryTime: 0,
+                limitIp: 0,
+                limitHwid: 0,
+                tgId: 0,
+                enable: true
+            },
+            inboundIds: $inboundIds
+        }')
+
+    client_response=$(curl -ksS \
+        -b "${cookie_file}" -c "${cookie_file}" \
+        -H 'Content-Type: application/json' \
+        -H "X-CSRF-Token: ${csrf_token}" \
+        --data "${client_payload}" \
+        "${base_url}/panel/api/clients/add" 2>/dev/null || true)
+
+    rm -f "${cookie_file}"
+
+    if [[ $(printf '%s' "${client_response}" | jq -r '.success // false' 2>/dev/null) == "true" ]]; then
+        msg_ok "Default client created: email=first, subId=first (4 inbounds)."
+        return 0
+    fi
+
+    msg_err "3x-ui did not create default client 'first': ${client_response}"
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # INSTALL FAKE SITE
 # ─────────────────────────────────────────────────────────────────────────────
 install_clash_sub() {
@@ -1205,6 +1329,8 @@ show_results() {
         msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
         echo -e "Username:  ${config_username}\n"
         echo -e "Password:  ${config_password}\n"
+        msg_inf "Default client: first"
+        msg_inf "Subscription: https://${domain}/${sub_path}/first"
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
         msg_inf "Network Diagnostics (panel login required): https://${domain}/${panel_path}/diag\n"
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
@@ -1234,6 +1360,7 @@ main() {
 
     configure_nginx
     configure_xui_db
+    create_default_client
     install_clash_sub
     install_fake_site
     install_diagnostics
